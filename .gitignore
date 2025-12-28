@@ -1,0 +1,10 @@
+/__pycache__/
+/83_IMAGE*
+/filesystem.squashfs
+/squashfs-root
+/ExtractedImage
+*/extractions
+/Rooted
+/Stock
+/rootfs
+.venv

@@ -1,0 +1,4 @@
+l2nand 83
+#skip //Done booting!
+#do not use non-printable characters (ASCII < 0x20, or >0x7e), otherwise the execution will abort.
+#do not insert empty line in between, otherwise the execution will abort.

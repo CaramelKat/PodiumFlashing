@@ -1,0 +1,19 @@
+{
+	"cSpell.words": [
+		"bcolors",
+		"ENDC",
+		"erom",
+		"geteuid",
+		"imager",
+		"mksquashfs",
+		"nand",
+		"noappend",
+		"OKBLUE",
+		"OKCYAN",
+		"OKGREEN",
+		"rootfs",
+		"sysinit",
+		"unsquashfs",
+		"usbload"
+	]
+}
