@@ -273,7 +273,7 @@ def flashImage(imagePath: Path, verbose: bool):
 
     print('Getting ready to flash image...')
 
-    flashDIR = Path('./marvellFlashTool')
+    flashDIR = Path('./marvell_flash_tool')
     if not flashDIR.is_dir():
         print(f'Error! Missing {flashDIR}. Flashing cannot continue!')
         exit(4)
