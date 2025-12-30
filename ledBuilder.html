@@ -36,6 +36,7 @@
 			display: flex;
 			flex-direction: column;
 			align-items: center;
+			gap: 1em;
 		}
 
 		.matrix-border {
@@ -126,67 +127,72 @@
 		</div>
 		<div class="picker-wrapper">
 			<div>
-				<input type="color" id="1" name="led1" value="#000000"/>
+				<input type="color" id="1" name="led1" value="#000000" />
 				<label for="led1">LED 1</label>
 			</div>
 			<div>
-				<input type="color" id="2" name="led2" value="#000000"/>
+				<input type="color" id="2" name="led2" value="#000000" />
 				<label for="led2">LED 2</label>
 			</div>
 			<div>
-				<input type="color" id="3" name="led3" value="#000000"/>
+				<input type="color" id="3" name="led3" value="#000000" />
 				<label for="led3">LED 3</label>
 			</div>
 			<div>
-				<input type="color" id="4" name="led4" value="#000000"/>
+				<input type="color" id="4" name="led4" value="#000000" />
 				<label for="led4">LED 4</label>
 			</div>
 			<div>
-				<input type="color" id="5" name="led5" value="#000000"/>
+				<input type="color" id="5" name="led5" value="#000000" />
 				<label for="led5">LED 5</label>
 			</div>
 			<div>
-				<input type="color" id="6" name="led6" value="#000000"/>
+				<input type="color" id="6" name="led6" value="#000000" />
 				<label for="led6">LED 6</label>
 			</div>
 			<div>
-				<input type="color" id="7" name="led7" value="#000000"/>
+				<input type="color" id="7" name="led7" value="#000000" />
 				<label for="led7">LED 7</label>
 			</div>
 			<div>
-				<input type="color" id="8" name="led8" value="#000000"/>
+				<input type="color" id="8" name="led8" value="#000000" />
 				<label for="led8">LED 8</label>
 			</div>
 			<div>
-				<input type="color" id="9" name="led9" value="#000000"/>
+				<input type="color" id="9" name="led9" value="#000000" />
 				<label for="led9">LED 9</label>
 			</div>
 			<div>
-				<input type="color" id="10" name="led10" value="#000000"/>
+				<input type="color" id="10" name="led10" value="#000000" />
 				<label for="led10">LED 10</label>
 			</div>
 			<div>
-				<input type="color" id="11" name="led11" value="#000000"/>
+				<input type="color" id="11" name="led11" value="#000000" />
 				<label for="led11">LED 11</label>
 			</div>
 			<div>
-				<input type="color" id="12" name="led12" value="#000000"/>
+				<input type="color" id="12" name="led12" value="#000000" />
 				<label for="led12">LED 12</label>
 			</div>
 			<div>
-				<input type="color" id="13" name="led13" value="#000000"/>
+				<input type="color" id="13" name="led13" value="#000000" />
 				<label for="led13">LED 13</label>
 			</div>
 		</div>
 	</div>
 	<footer>
-		<input type="file" id="file-upload"/>
+		<div>
+			<input type="file" id="file-upload" />
+			<label for="file-name">File Name:</label>
+			<input type="text" id="file-name" name="file-name"/>
+		</div>
 		<div>
 			<a id="frame-back" offset="-1">⬅️</a>
-			<a id="del-frame">🗑️</a>
 			<a id="playback">▶️</a>
-			<a id="add-frame">➕</a>
 			<a id="frame-forward" offset="1">➡️</a>
+			<a id="del-frame">🗑️</a>
+			<a id="add-frame">➕</a>
+			<a id="download">💾</a>
 		</div>
 		<div id="frames">
 		</div>
@@ -202,12 +208,37 @@
 	let timer = undefined;
 
 	const fileUploadInput = document.getElementById('file-upload');
+	const fileNameInput = document.getElementById('file-name');
 	const framesWrapper = document.getElementById('frames');
 	const frameBack = document.getElementById('frame-back');
 	const frameForward = document.getElementById('frame-forward');
 	const playbackControl = document.getElementById('playback');
 	const addFrameBtn = document.getElementById('add-frame');
 	const delFrameBtn = document.getElementById('del-frame');
+	const downloadBtn = document.getElementById('download');
+
+	function downloadURL(data, fileName) {
+		const a = document.createElement('a')
+		a.href = data
+		a.download = fileName
+		document.body.appendChild(a)
+		a.style.display = 'none'
+		a.click()
+		a.remove()
+	}
+
+	function downloadBlob(data, fileName) {
+
+		const blob = new Blob([data], {
+			type: 'application/octet-stream'
+		})
+
+		const url = window.URL.createObjectURL(blob)
+
+		downloadURL(url, fileName)
+
+		setTimeout(() => window.URL.revokeObjectURL(url), 1000)
+	}
 
 	frameBack.addEventListener("click", function (e) {
 		if (playing) return;
@@ -220,8 +251,11 @@
 	playbackControl.addEventListener("click", togglePlayback);
 	addFrameBtn.addEventListener("click", addFrame);
 	delFrameBtn.addEventListener("click", delFrame);
+	downloadBtn.addEventListener("click", download);
 
 	document.addEventListener('keydown', (event) => {
+		if (event.target == fileNameInput)
+			return;
 		event.preventDefault();
 		switch (event.key) {
 			case "ArrowLeft":
@@ -286,7 +320,7 @@
 
 	function addFrame() {
 		let oldIndex = currentIndex;
-		frames.splice(oldIndex + 1, 0, [[0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,0,0]]);
+		frames.splice(oldIndex + 1, 0, new Array(NUM_LEDS).fill([0, 0, 0]));
 		initFrames();
 		setFrame(oldIndex + 1);
 	}
@@ -338,11 +372,20 @@
 	}
 
 	function setLed(index, color) {
-		console.log(index, color)
 		frames[currentIndex][index - 1][0] = color.r;
 		frames[currentIndex][index - 1][1] = color.g;
 		frames[currentIndex][index - 1][2] = color.b;
 		document.documentElement.style.setProperty(`--led-${index}`, `rgb(${color.r}, ${color.g}, ${color.b})`);
+	}
+
+	function download() {
+		let fileBuffer = [];
+		for (let led of frames.flat()) {
+			for (let val of led)
+				fileBuffer.push(val);
+		}
+		let name = fileNameInput.value.trim() == '' ? 'Invoke.bin' : fileNameInput.value + '.bin'
+		downloadBlob(new Uint8Array(fileBuffer).buffer, name)
 	}
 
 	fileUploadInput.addEventListener('change', function () {
@@ -350,6 +393,7 @@
 		reader.onload = function () {
 			let arrayBuffer = this.result, array = new Uint8Array(arrayBuffer);
 			if (array.length % VALID_FILE_MOD != 0) {
+				window.alert('File is invalid length!!');
 				console.error('File is invalid length!!', array.length, array.length % VALID_FILE_MOD);
 				return;
 			}
@@ -363,7 +407,6 @@
 
 	for (let input of document.querySelectorAll('input[type=color]')) {
 		input.addEventListener('change', function (e) {
-			console.log(e.target)
 			setLed(Number(e.target.id), hexToRgb(e.target.value))
 		}, false)
 	}
