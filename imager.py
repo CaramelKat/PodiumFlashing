@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import threading
+import atexit
 import pexpect
 import shutil
 import argparse
@@ -15,6 +16,8 @@ from processRunner import Command
 EXTRACTION_PATH = './ExtractedImage'
 
 BLOCK_SIZE = 131072
+
+SKIP_SCRIPT = b'#skip\n'
 
 REQUIRED_FILES = [
     Path('06_IMAGE'),
@@ -310,11 +313,38 @@ def buildImage(image: InvokeImage):
         print('Failed to build image!')
         exit(2)
 
-def flashImage(imagePath: Path, verbose: bool, logFile: Path = None):
-    if not imagePath:
+def uboot_input_filter():
+    # U-Boot doesn't echo over this link and the pty echo is disabled, so echo locally and map DEL to ^H.
+    lineLen = 0
+
+    def filt(data: bytes) -> bytes:
+        nonlocal lineLen
+        out = bytearray()
+        for b in data:
+            if b in (0x7f, 0x08):
+                if lineLen:
+                    lineLen -= 1
+                    sys.stdout.write('\b \b')
+                out.append(0x08)
+            elif b in (0x0d, 0x0a):
+                lineLen = 0
+                out.append(b)
+            elif 0x20 <= b < 0x7f:
+                lineLen += 1
+                sys.stdout.write(chr(b))
+                out.append(b)
+            else:
+                out.append(b)
+        sys.stdout.flush()
+        return bytes(out)
+
+    return filt
+
+def flashImage(imagePath: Path, verbose: bool, logFile: Path = None, ubootShell: bool = False):
+    if not imagePath and not ubootShell:
         imagePath =  Path(EXTRACTION_PATH, '83_IMAGE_REBUILT')
 
-    if not imagePath.exists():
+    if not ubootShell and not imagePath.exists():
         print(f'Error! {args.path} was not found!!')
         exit(4)
 
@@ -332,9 +362,17 @@ def flashImage(imagePath: Path, verbose: bool, logFile: Path = None):
             exit(3)
 
     # Copy image to flashing directory
-    newImagePath = (flashDIR / '83_IMAGE')
-    newImagePath.unlink(missing_ok=True)
-    shutil.copy(imagePath, newImagePath)
+    if not ubootShell:
+        newImagePath = (flashDIR / '83_IMAGE')
+        newImagePath.unlink(missing_ok=True)
+        shutil.copy(imagePath, newImagePath)
+
+    if ubootShell:
+        # A 79_IMAGE containing flash commands would start flashing; swap in a script that stops at the prompt.
+        bootScript = flashDIR / '79_IMAGE'
+        originalScript = bootScript.read_bytes()
+        atexit.register(bootScript.write_bytes, originalScript)
+        bootScript.write_bytes(SKIP_SCRIPT)
 
     usbBootBin = flashDIR / Path('usb_boot')
     tagged = TaggedLog(logFile) if verbose else None
@@ -370,6 +408,18 @@ def flashImage(imagePath: Path, verbose: bool, logFile: Path = None):
 
         client.expect('Marvell U-boot', timeout=120)
         print('U-Boot Shell Loaded')
+
+        if ubootShell:
+            client.expect(r'MV88DE3100\|>', timeout=60)
+            client.logfile = None
+            process.log = False
+            print(bcolors.OKGREEN + '\nInteractive U-Boot shell. Press Ctrl+] to exit.' + bcolors.ENDC)
+            client.setecho(False)
+            client.send('\r')
+            client.interact(input_filter=uboot_input_filter())
+            client.close()
+            process.stop()
+            return
 
         client.expect('do_usbload, loading image 83', timeout=120)
         print('Sending 83_IMAGE to Invoke...')
@@ -483,7 +533,7 @@ def main(args):
             packFS()
 
         case Commands.flash:
-            flashImage(args.path, args.verbose, args.log_file)
+            flashImage(args.path, args.verbose, args.log_file, args.uboot_shell)
 
         case Commands.quickBuild:
             if not image:
@@ -505,6 +555,9 @@ if __name__ == "__main__":
     parser.add_argument('-v', '--verbose', action='store_true')
     parser.add_argument('--log-file', type=Path, default=Path('flash.log'),
                         help='Where verbose flashing output is saved (default: flash.log)')
+
+    parser.add_argument('--uboot-shell', action='store_true',
+                        help='With flash: boot to the U-Boot prompt and attach an interactive shell instead of flashing')
 
     args = parser.parse_args()
 
