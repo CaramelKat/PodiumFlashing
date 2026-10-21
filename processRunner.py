@@ -77,7 +77,7 @@ class OutStream:
 
     def fileno(self):
         return self._fileno
-    
+
 class Command:
 
     def __init__(self, cmd, log):
@@ -114,12 +114,12 @@ class Command:
                 if string in line:
                     return True
         return False
-    
+
     def logToBuffer(self):
         # Log to sys.stdout.buffer
         while self.streams:
             lines = self.fetchStream()
-            if not self.log:
+            if not self.log or not lines:
                 continue
 
             for line in lines:
@@ -132,9 +132,9 @@ class Command:
     def fetchStream(self):
         if not self.streams:
             return
-        
+
         outputLines = []
-        
+
         while True:
             try:
                 rlist, _, _ = select.select(self.streams, [], [])
