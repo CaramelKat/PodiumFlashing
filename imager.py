@@ -1,5 +1,7 @@
 import os
 import sys
+import time
+import threading
 import pexpect
 import shutil
 import argparse
@@ -26,6 +28,51 @@ REQUIRED_FILES = [
     Path('sysinit.img'),
     Path('usb_boot')
 ]
+
+class TaggedLog:
+    """Interleaves usb_boot and telnet output as timestamped, source-tagged lines."""
+    SOURCES = {
+        'usb_boot': '\033[93m',
+        'telnet':   '\033[96m',
+        'imager':   '\033[91m',
+    }
+
+    def __init__(self, logPath=None):
+        self.file = open(logPath, 'w', buffering=1) if logPath else None
+        self.lock = threading.Lock()
+        self.start = time.monotonic()
+        self.partial = {}
+
+    def line(self, source, text):
+        stamp = time.monotonic() - self.start
+        color = self.SOURCES[source]
+        with self.lock:
+            sys.stdout.write(f'{color}[{stamp:8.3f}] {source:<8} | {text}\033[0m\n')
+            sys.stdout.flush()
+            if self.file:
+                self.file.write(f'[{stamp:8.3f}] {source:<8} | {text}\n')
+
+    def close(self):
+        if self.file:
+            self.file.close()
+            self.file = None
+
+    def printer(self, source):
+        return lambda text: self.line(source, text)
+
+    def writer(self, source):
+        # File-like object for pexpect's logfile; buffers until a full line arrives.
+        log = self
+        class Writer:
+            def write(self, data):
+                text = log.partial.get(source, '') + data.decode(errors='replace').replace('\r', '')
+                *lines, log.partial[source] = text.split('\n')
+                for l in lines:
+                    if l:
+                        log.line(source, l)
+            def flush(self):
+                pass
+        return Writer()
 
 class bcolors:
     HEADER = '\033[95m'
@@ -263,7 +310,7 @@ def buildImage(image: InvokeImage):
         print('Failed to build image!')
         exit(2)
 
-def flashImage(imagePath: Path, verbose: bool):
+def flashImage(imagePath: Path, verbose: bool, logFile: Path = None):
     if not imagePath:
         imagePath =  Path(EXTRACTION_PATH, '83_IMAGE_REBUILT')
 
@@ -290,7 +337,11 @@ def flashImage(imagePath: Path, verbose: bool):
     shutil.copy(imagePath, newImagePath)
 
     usbBootBin = flashDIR / Path('usb_boot')
-    process = Command([usbBootBin, '1286', '8174', f'{flashDIR.resolve()}/', '8141'], verbose)
+    tagged = TaggedLog(logFile) if verbose else None
+    if tagged and logFile:
+        print(f'Writing verbose log to {logFile}')
+    process = Command([usbBootBin, '1286', '8174', f'{flashDIR.resolve()}/', '8141'], verbose,
+                      tagged.printer('usb_boot') if verbose else None)
 
     process.start()
     client = None
@@ -300,7 +351,7 @@ def flashImage(imagePath: Path, verbose: bool):
 
         client = pexpect.spawn("telnet 127.0.0.1 8141")
         if verbose:
-            client.logfile = sys.stdout.buffer
+            client.logfile = tagged.writer('telnet')
 
         print(bcolors.HEADER + '\n============================ Invoke Flasher============================' + bcolors.ENDC)
         print('Follow the directions below to flash your Invoke:')
@@ -325,12 +376,12 @@ def flashImage(imagePath: Path, verbose: bool):
         process.log = True
 
         client.expect('do_l2nand, loading image 0x83', timeout=30)
-        process.log = False
+        process.log = verbose
         print('Invoke loading image...')
 
         client.expect('Erase NAND chip...', timeout=120)
         print('Erasing NAND...')
-        client.logfile = sys.stdout.buffer
+        client.logfile = tagged.writer('telnet') if verbose else sys.stdout.buffer
 
         client.expect('Congratulations! u2nand succeed!', timeout=300)
 
@@ -353,10 +404,14 @@ def flashImage(imagePath: Path, verbose: bool):
         print('Make sure you have the correct image selected!')
         if verbose:
             print(traceback.format_exc())
+            for line in traceback.format_exc().splitlines():
+                tagged.line('imager', line)
 
     if client:
         client.close()
     process.stop()
+    if tagged:
+        tagged.close()
 
 def unpackFS():
     # Check if rootfs.bin exists
@@ -428,7 +483,7 @@ def main(args):
             packFS()
 
         case Commands.flash:
-            flashImage(args.path, args.verbose)
+            flashImage(args.path, args.verbose, args.log_file)
 
         case Commands.quickBuild:
             if not image:
@@ -436,7 +491,7 @@ def main(args):
                 return
             packFS()
             buildImage(image)
-            flashImage(Path(EXTRACTION_PATH, '83_IMAGE_REBUILT'), args.verbose)
+            flashImage(Path(EXTRACTION_PATH, '83_IMAGE_REBUILT'), args.verbose, args.log_file)
 
 if __name__ == "__main__":
     if os.geteuid() != 0:
@@ -448,6 +503,8 @@ if __name__ == "__main__":
     parser.add_argument('command', type=Commands, choices=list(Commands), help="Action to perform on image",)
     parser.add_argument("path", nargs="?", help="Path to image to extract", type=Path)
     parser.add_argument('-v', '--verbose', action='store_true')
+    parser.add_argument('--log-file', type=Path, default=Path('flash.log'),
+                        help='Where verbose flashing output is saved (default: flash.log)')
 
     args = parser.parse_args()
 

@@ -80,8 +80,9 @@ class OutStream:
 
 class Command:
 
-    def __init__(self, cmd, log):
+    def __init__(self, cmd, log, printer=None):
         self.cmd = cmd
+        self.printer = printer
         self.streams = None
         self.process = None
         self.lines = []
@@ -124,6 +125,9 @@ class Command:
 
             for line in lines:
                 if line:
+                    if self.printer:
+                        self.printer(line)
+                        continue
                     line = f"{bcolors.WARNING}{line}{bcolors.ENDC}\n"
                     sys.stdout.buffer.write(line.encode())
                     sys.stdout.buffer.flush()
