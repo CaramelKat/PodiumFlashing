@@ -425,7 +425,7 @@ def flashImage(imagePath: Path, verbose: bool, logFile: Path = None, ubootShell:
         print('Sending 83_IMAGE to Invoke...')
         process.log = True
 
-        client.expect('do_l2nand, loading image 0x83', timeout=30)
+        client.expect(r'do_l2nand, load(ing|img) image 0x83', timeout=30)
         process.log = verbose
         print('Invoke loading image...')
 
