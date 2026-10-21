@@ -1,0 +1,5 @@
+usbload 0x81 0x0c400000
+usbload 0x82 0x08000000
+set bootargs console=ttyS0,115200 debug init=/bin/sh root=/dev/ram  mtdparts=mv_nand:128K(block0)ro,1M(prebootloader)ro,4M(TZ)ro,4M(TZ-B)ro,512K(postbootloader)ro,512K(postbootloader-B)ro,8M(kernel)ro,105M(rootfs)ro,117120K(cache),15M(recovery),512K(fts)ro,2M(factory_store)ro,1M@255M(bbt)ro initrd=0x08000000,35497472
+bootm 0x0c400000
+
