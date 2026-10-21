@@ -24,11 +24,46 @@
 #define LOG(line, fmt, ...) printf("%s, %d: " fmt, __func__, line, ##__VA_ARGS__)
 #define ELOG(line, fmt, ...) fprintf(stderr, "%s, %d: " fmt, __func__, line, ##__VA_ARGS__)
 
-#define IMG_BLOCK_SIZE 0x100000
-#define EP_BULK_OUT 0x01
-#define EP_BULK_IN 0x81
-#define EP_INTR_OUT 0x02
-#define EP_INTR_IN 0x82
+// USB endpoints used by the boot ROM / bootloader.
+#define EP_BULK_OUT 0x01  // host -> device: image data
+#define EP_BULK_IN 0x81   // device -> host: data (only logged)
+#define EP_INTR_OUT 0x02  // host -> device: console input
+#define EP_INTR_IN 0x82   // device -> host: console output and image requests
+
+#define IMG_BLOCK_SIZE 0x100000    // image is streamed in 1 MiB chunks
+#define IMG_HEADER_SIZE 8          // first transfer: 32-bit image size + 4 unused bytes
+#define USB_BUF_SIZE 0x400
+#define IROM_SUBCLASS 0xff         // device is the iROM-stage dongle (bcm_erom.bin.usb)
+#define SIZE_FILE_MIN_REQUEST 0x7a // requests above 0x79 also record the image size in 07_IMAGE
+#define ERR_NO_DEVICE (-5)
+
+// The device asks for an image by sending IMG_REQUEST_MARKER followed by one request byte.
+#define IMG_REQUEST_MARKER "i*m*g*r*q*"
+#define IMG_REQUEST_MARKER_LEN 10
+enum ImgRequest : unsigned char {
+    REQ_IGNORE = 0x01,
+    REQ_SYSINIT = 0x02,
+    REQ_BOOTLOADER = 0x03,
+    REQ_DRM_EROM = 0x05,
+};
+
+// Telnet protocol bytes (RFC 854/855).
+enum Telnet : unsigned char {
+    TEL_SE = 0xf0,
+    TEL_NOP = 0xf1,
+    TEL_IP = 0xf4,
+    TEL_AYT = 0xf6,
+    TEL_SB = 0xfa,
+    TEL_WILL = 0xfb,
+    TEL_WONT = 0xfc,
+    TEL_DO = 0xfd,
+    TEL_DONT = 0xfe,
+    TEL_IAC = 0xff,
+};
+#define TEL_FIRST_COMMAND 0xec
+#define TEL_OPT_BINARY 0
+#define TEL_OPT_ECHO 1
+#define TEL_OPT_SUPPRESS_GO_AHEAD 3
 
 const char* telcmds[] = {
     "EOF", "SUSP", "ABORT", "EOR", "SE",  "NOP",  "DMARK", "BRK", "IP",   "AO",   "AYT",
@@ -45,9 +80,9 @@ static unsigned int g_pid = 0x8174;
 static int img_path_prefix_len;
 static char img_path_prefix[0x100];
 static char img_name[0x140];
-static unsigned char in_buf[0x400];
-static unsigned char intr_in_buf[0x400];
-static unsigned char sock_recv_buf[0x400];
+static unsigned char in_buf[USB_BUF_SIZE];
+static unsigned char intr_in_buf[USB_BUF_SIZE];
+static unsigned char sock_recv_buf[USB_BUF_SIZE];
 static char* telnet_cmd_s;
 static libusb_device_handle* h;
 static libusb_context* ctx;
@@ -74,6 +109,12 @@ static sem_t* attach;
 static sem_t* detach;
 static volatile int g_usb_connected;
 static unsigned char g_last_img_type;
+
+// Image paths are plain concatenations (<IMAGE_DIR prefix><name>), so IMAGE_DIR must end in '/'.
+static void build_path(char* dst, const char* name) {
+    strncpy(dst, img_path_prefix, strlen(img_path_prefix) + 1);
+    strcat(dst, name);
+}
 
 static void my_usleep(useconds_t us) {
     usleep(us);
@@ -128,7 +169,7 @@ static int find_boot_target(libusb_context* c, unsigned short vid, unsigned shor
     FILE* f;
 
     h = libusb_open_device_with_vid_pid_subclass(c, vid, pid, subclass);
-    if (h != nullptr && *subclass != 0xff) {
+    if (h != nullptr && *subclass != IROM_SUBCLASS) {
         libusb_device* dev = libusb_get_device(h);
         uint8_t bus = libusb_get_bus_number(dev);
         sprintf(path, "%d-", bus);
@@ -145,18 +186,17 @@ static int find_boot_target(libusb_context* c, unsigned short vid, unsigned shor
             }
         }
         path[strlen(path) + 1] = '\0';
-        strncpy(fname, img_path_prefix, strlen(img_path_prefix) + 1);
-        strcat(fname, "06_IMAGE");
+        build_path(fname, "06_IMAGE");
         LOG(0x113, "store USB path to temp file %s.\n", fname);
         f = fopen(fname, "wb");
         if (f == nullptr) {
             ELOG(0x116, "failed to open file %s, err %s\n", fname, strerror(errno));
-            return -5;
+            return ERR_NO_DEVICE;
         }
         fwrite(path, strlen(path) + 1, 1, f);
         fclose(f);
     }
-    return h == nullptr ? -5 : 0;
+    return h == nullptr ? ERR_NO_DEVICE : 0;
 }
 
 static void request_exit(int code) {
@@ -178,7 +218,7 @@ static void cb_data_recv(struct libusb_transfer* transfer) {
 
 static int submit_data_in_urb(void) {
     int r;
-    libusb_fill_bulk_transfer(in_transfer, h, EP_BULK_IN, in_buf, 0x400, cb_data_recv, nullptr, 0);
+    libusb_fill_bulk_transfer(in_transfer, h, EP_BULK_IN, in_buf, USB_BUF_SIZE, cb_data_recv, nullptr, 0);
     while ((r = libusb_submit_transfer(in_transfer)) == LIBUSB_ERROR_BUSY)
         my_usleep(1000);
     if (r < 0)
@@ -188,47 +228,41 @@ static int submit_data_in_urb(void) {
     return r;
 }
 
-// Names are built as <IMAGE_DIR prefix><name>; "drm_erom.img" is requested as "./drm_erom.img".
-static void process_img_request(unsigned char type) {
-    char hex[8];
-
-    if (type == 2) {
-        strncpy(img_name, img_path_prefix, strlen(img_path_prefix) + 1);
-        strcat(img_name, "sysinit.img");
-        request_received = 1;
-        is_img_header_sent = 0;
-        LOG(0x157, "received request from dongle to send image %s.\n", img_name);
-        pthread_cond_signal(&event_cond);
-        return;
-    }
-    if (type == 1)
-        return;
-    if (type == 3) {
-        strncpy(img_name, img_path_prefix, strlen(img_path_prefix) + 1);
-        strcat(img_name, "bootloader.img");
-        request_received = 1;
-        is_img_header_sent = 0;
-        LOG(0x15f, "received request from dongle to send image %s.\n", img_name);
-        pthread_cond_signal(&event_cond);
-        return;
-    }
-    if (type == 5) {
-        strncpy(img_name, img_path_prefix, strlen(img_path_prefix) + 1);
-        strcat(img_name, "./drm_erom.img");
-        request_received = 1;
-        is_img_header_sent = 0;
-        LOG(0x167, "received request from dongle to send image %s.\n", img_name);
-        pthread_cond_signal(&event_cond);
-        return;
-    }
-    strncpy(img_name, img_path_prefix, strlen(img_path_prefix) + 1);
-    snprintf(hex, 3, "%02x", type);
-    strcat(img_name, hex);
-    strcat(img_name, "_IMAGE");
+static void queue_image_request(unsigned int log_line) {
     request_received = 1;
     is_img_header_sent = 0;
-    LOG(0x172, "received request from dongle to send image %s.\n", img_name);
+    // The line number only exists to keep log output identical to the original tool.
+    printf("%s, %d: received request from dongle to send image %s.\n", "process_img_request", log_line, img_name);
     pthread_cond_signal(&event_cond);
+}
+
+static void process_img_request(unsigned char type) {
+    switch (type) {
+    case REQ_IGNORE:
+        return;
+    case REQ_SYSINIT:
+        build_path(img_name, "sysinit.img");
+        queue_image_request(0x157);
+        return;
+    case REQ_BOOTLOADER:
+        build_path(img_name, "bootloader.img");
+        queue_image_request(0x15f);
+        return;
+    case REQ_DRM_EROM:
+        // The "./" is a quirk of the original and is kept for identical paths.
+        build_path(img_name, "./drm_erom.img");
+        queue_image_request(0x167);
+        return;
+    default: {
+        // Any other code N is served from "<NN>_IMAGE" (NN = two lowercase hex digits).
+        char hex[8];
+        build_path(img_name, "");
+        snprintf(hex, 3, "%02x", type);
+        strcat(img_name, hex);
+        strcat(img_name, "_IMAGE");
+        queue_image_request(0x172);
+    }
+    }
 }
 
 static void process_rcvd_buf(struct libusb_transfer* transfer) {
@@ -237,12 +271,12 @@ static void process_rcvd_buf(struct libusb_transfer* transfer) {
     size_t n = 0;
 
     for (len = transfer->actual_length; 0 < len; len = (len - (int)n) - 1) {
-        char* m = strstr(p, "i*m*g*r*q*");
+        char* m = strstr(p, IMG_REQUEST_MARKER);
         if (m != nullptr) {
-            g_last_img_type = m[10];
+            g_last_img_type = m[IMG_REQUEST_MARKER_LEN];
             process_img_request(g_last_img_type);
-            memmove(m, m + 11, (long)len - 11);
-            transfer->actual_length -= 11;
+            memmove(m, m + IMG_REQUEST_MARKER_LEN + 1, (long)len - (IMG_REQUEST_MARKER_LEN + 1));
+            transfer->actual_length -= IMG_REQUEST_MARKER_LEN + 1;
         }
         n = strlen(p);
         p += n + 1;
@@ -272,7 +306,7 @@ static void cb_intr_in(struct libusb_transfer* transfer) {
 
 static int submit_intr_in_urb(void) {
     int r;
-    libusb_fill_interrupt_transfer(intr_in_transfer, h, EP_INTR_IN, intr_in_buf, 0x400, cb_intr_in, nullptr, 0);
+    libusb_fill_interrupt_transfer(intr_in_transfer, h, EP_INTR_IN, intr_in_buf, USB_BUF_SIZE, cb_intr_in, nullptr, 0);
     while ((r = libusb_submit_transfer(intr_in_transfer)) == LIBUSB_ERROR_BUSY)
         my_usleep(1000);
     if (r < 0)
@@ -311,14 +345,13 @@ static unsigned int get_img_size(void) {
     size = (unsigned int)ftell(fp);
     fseek(fp, 0, SEEK_SET);
     LOG(0x1e5, "size %d\n", size);
-    if (g_last_img_type > 0x79) {
-        strncpy(fname, img_path_prefix, strlen(img_path_prefix) + 1);
-        strcat(fname, "07_IMAGE");
+    if (g_last_img_type >= SIZE_FILE_MIN_REQUEST) {
+        build_path(fname, "07_IMAGE");
         LOG(0x1eb, "store requested image size to temp file %s.\n", fname);
         f = fopen(fname, "wb");
         if (f == nullptr) {
             ELOG(0x1ef, "failed to open file %s, err %s\n", fname, strerror(errno));
-            return (unsigned int)-5;
+            return (unsigned int)ERR_NO_DEVICE;
         }
         fwrite(&size, 4, 1, f);
         fclose(f);
@@ -330,7 +363,7 @@ static unsigned long feed_buf(void) {
     if (is_img_header_sent == 0) {
         *imgbuf = img_size;
         LOG(0x1fd, "sending image header package, size %d.\n", img_size);
-        return 8;
+        return IMG_HEADER_SIZE;
     }
     size_t n = fread(imgbuf, 1, IMG_BLOCK_SIZE, fp);
     LOG(0x202, "read %d bytes from image file.\n", (unsigned int)n);
@@ -449,10 +482,10 @@ static int send_telnet_cmd(int fd, unsigned int cmd, unsigned int opt) {
     unsigned char* p = buf;
 
     LOG(0x2d1, "sending %d, opt %d\n", cmd, opt);
-    *p++ = 0xff;
-    if (cmd < 0x100 && cmd > 0xeb) {
+    *p++ = TEL_IAC;
+    if (cmd < 0x100 && cmd >= TEL_FIRST_COMMAND) {
         *p++ = (unsigned char)cmd;
-        if (cmd == 0xfe || cmd == 0xfd || cmd == 0xfc || cmd == 0xfb)
+        if (cmd == TEL_DONT || cmd == TEL_DO || cmd == TEL_WONT || cmd == TEL_WILL)
             *p++ = (unsigned char)opt;
         return send(fd, buf, p - buf, 0) < 1 ? -1 : 0;
     }
@@ -460,11 +493,12 @@ static int send_telnet_cmd(int fd, unsigned int cmd, unsigned int opt) {
 }
 
 static void init_telnet_conn(int fd) {
-    send_telnet_cmd(fd, 0xfd, 0);
-    send_telnet_cmd(fd, 0xfc, 1);
-    send_telnet_cmd(fd, 0xfd, 3);
-    send_telnet_cmd(fd, 0xfb, 0);
-    send_telnet_cmd(fd, 0xfb, 3);
+    // Ask the client for binary + suppress-go-ahead, offer the same, and disable local echo.
+    send_telnet_cmd(fd, TEL_DO, TEL_OPT_BINARY);
+    send_telnet_cmd(fd, TEL_WONT, TEL_OPT_ECHO);
+    send_telnet_cmd(fd, TEL_DO, TEL_OPT_SUPPRESS_GO_AHEAD);
+    send_telnet_cmd(fd, TEL_WILL, TEL_OPT_BINARY);
+    send_telnet_cmd(fd, TEL_WILL, TEL_OPT_SUPPRESS_GO_AHEAD);
 }
 
 static int process_recved_telnet_cmd(int fd, unsigned char cmd) {
@@ -474,10 +508,10 @@ static int process_recved_telnet_cmd(int fd, unsigned char cmd) {
     int n;
 
     switch (cmd) {
-    case 0xf6:
-        send_telnet_cmd(fd, 0xf1, 0);
+    case TEL_AYT:
+        send_telnet_cmd(fd, TEL_NOP, 0);
         break;
-    case 0xfa:
+    case TEL_SB:
         for (int i = 0; i < 0x80; i++) {
             n = (int)recv(fd, &c[0], 1, 0);
             if (n < 1) {
@@ -485,7 +519,7 @@ static int process_recved_telnet_cmd(int fd, unsigned char cmd) {
                 return -1;
             }
             LOG(0x312, "recved %d, char %c\n", (int)c[0], (int)c[0]);
-            if (c[1] == -1) {
+            if (c[1] == (char)TEL_IAC) {
                 n = (int)recv(fd, &c[0], 1, 0);
                 if (n > 0) {
                     LOG(0x31a, "recved %d, char %c\n", (int)c[0], (int)c[0]);
@@ -496,8 +530,8 @@ static int process_recved_telnet_cmd(int fd, unsigned char cmd) {
             }
         }
         break;
-    case 0xfb:
-    case 0xfd:
+    case TEL_WILL:
+    case TEL_DO:
         n = (int)recv(fd, &c[0], 1, 0);
         if (n < 1) {
             ELOG(0x2f8, "recv failed, err %s\n", strerror(errno));
@@ -506,8 +540,8 @@ static int process_recved_telnet_cmd(int fd, unsigned char cmd) {
         LOG(0x2fc, "recved cmd %d, opt %d\n", cmd, (int)c[0]);
         send_telnet_cmd(fd, cmd + 1, 1);
         break;
-    case 0xfc:
-    case 0xfe:
+    case TEL_WONT:
+    case TEL_DONT:
         n = (int)recv(fd, &c[0], 1, 0);
         if (n < 1) {
             ELOG(0x303, "recv failed, err %s\n", strerror(errno));
@@ -535,7 +569,7 @@ static int telnet_getchar(int fd, unsigned char* out) {
             *out = 10;
             return 0;
         }
-        if (c != 0xff) {
+        if (c != TEL_IAC) {
             *out = c;
             return 0;
         }
@@ -543,7 +577,7 @@ static int telnet_getchar(int fd, unsigned char* out) {
         if (n < 1)
             break;
         LOG(0x33c, "recved %d, char %c\n", c, c);
-        if (c != 0xff && (n = process_recved_telnet_cmd(fd, c)) < 0)
+        if (c != TEL_IAC && (n = process_recved_telnet_cmd(fd, c)) < 0)
             return -1;
     }
     ELOG(0x338, "recv failed, err %s\n", strerror(errno));
@@ -591,7 +625,7 @@ static void* tcp_server_func(void* arg) {
                     goto again;
                 }
                 sock_recv_buf[len++] = ch;
-            } while (ch != '\n' && len < 0x400);
+            } while (ch != '\n' && len < USB_BUF_SIZE);
             if (g_usb_connected != 0 && 0 < len) {
                 LOG(0x37b, "sending %s, len %d to dongle.\n", sock_recv_buf, len);
                 filter_out_substring(reinterpret_cast<char*>(sock_recv_buf), &len, "PuTTY");
@@ -632,11 +666,11 @@ static int allocate_transfer(void) {
         intr_in_transfer = nullptr;
         goto free_in;
     }
-    libusb_fill_bulk_transfer(out_transfer, h, EP_BULK_OUT, reinterpret_cast<unsigned char*>(imgbuf), 8,
+    libusb_fill_bulk_transfer(out_transfer, h, EP_BULK_OUT, reinterpret_cast<unsigned char*>(imgbuf), IMG_HEADER_SIZE,
                               cb_img_write, nullptr, 0);
-    libusb_fill_bulk_transfer(in_transfer, h, EP_BULK_IN, in_buf, 0x400, cb_data_recv, nullptr, 0);
-    libusb_fill_interrupt_transfer(intr_in_transfer, h, EP_INTR_IN, intr_in_buf, 0x400, cb_intr_in, nullptr, 0);
-    libusb_fill_interrupt_transfer(intr_out_transfer, h, EP_INTR_OUT, sock_recv_buf, 0x400, cb_intr_out, nullptr,
+    libusb_fill_bulk_transfer(in_transfer, h, EP_BULK_IN, in_buf, USB_BUF_SIZE, cb_data_recv, nullptr, 0);
+    libusb_fill_interrupt_transfer(intr_in_transfer, h, EP_INTR_IN, intr_in_buf, USB_BUF_SIZE, cb_intr_in, nullptr, 0);
+    libusb_fill_interrupt_transfer(intr_out_transfer, h, EP_INTR_OUT, sock_recv_buf, USB_BUF_SIZE, cb_intr_out, nullptr,
                                    0);
     return 0;
 free_in:
@@ -694,8 +728,7 @@ static int serve_irom_stage_dongle(void) {
         } else {
             is_img_header_sent = 1;
             request_not_finished = 1;
-            strncpy(img_name, img_path_prefix, strlen(img_path_prefix) + 1);
-            strcat(img_name, "bcm_erom.bin.usb");
+            build_path(img_name, "bcm_erom.bin.usb");
             if (send_first_image_block(img_name) < 0) {
                 ELOG(0x3fc, "Error, write image failed\n");
             } else {
@@ -745,7 +778,7 @@ static int serve_one_target(void) {
         ELOG(0x434, "Could not find/open device %x %x\n", g_vid, g_pid);
     } else {
         LOG(0x438, "sub_class: %d\n", subclass);
-        if (subclass == 0xff) {
+        if (subclass == IROM_SUBCLASS) {
             LOG(0x43a, "iROM stage dongle connected.\n");
             r = serve_irom_stage_dongle();
         } else {
