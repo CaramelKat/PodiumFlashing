@@ -1,12 +1,16 @@
+#!/usr/bin/python
 import os
 import re
 import time
 import subprocess
+import shutil
 import requests
 import json
 import html
 import socket
 import urllib3
+import concurrent.futures
+import platform
 
 CERT = False
 urllib3.disable_warnings()
@@ -15,6 +19,7 @@ urllib3.disable_warnings()
 
 IP = '192.168.43.1'
 DOMAIN = f'https://{IP}'
+MAC_PATTERN = r"(([0-9A-Fa-f]{1,2}[:-]){5}[0-9A-Fa-f]{1,2})"
 
 def parseTable(output):
 	lines = output.splitlines()
@@ -110,30 +115,227 @@ def checkStatus(ports = False):
 		return False
 
 def getMacAddress(addr):
-	ping = subprocess.run(['ping', addr, '-c', '1'], capture_output=True, text=True)
-	if '0% packet loss' not in ping.stdout:
-		return None
+	pingCommands = []
+	if platform.system().lower() == 'windows':
+		pingCommands.append(['ping', '-n', '1', addr])
 	else:
-		arp = subprocess.run(['arp', '-n', IP], capture_output=True, text=True)
-		mac = re.search(r"(([a-f\d]{1,2}\:){5}[a-f\d]{1,2})", arp.stdout)
-		if not mac:
-			return None
-		return mac.groups()[0]
+		# macOS and Linux both support -c for count.
+		pingCommands.append(['ping', '-c', '1', addr])
 
-def findInvokeIP(target_mac):
+	ping = None
+	for pingCmd in pingCommands:
+		try:
+			ping = subprocess.run(pingCmd, capture_output=True, text=True, timeout=2)
+			break
+		except (subprocess.TimeoutExpired, FileNotFoundError):
+			continue
+
+	if ping is None:
+		return None
+
+	if ping.returncode != 0:
+		return None
+
+	arpCommands = [
+		['ip', 'neigh', 'show', addr],
+		['arp', '-n', addr],
+		['arp', '-a', addr],
+		['arp', '-a']
+	]
+
+	arpOutput = ''
+	for arpCmd in arpCommands:
+		try:
+			arp = subprocess.run(arpCmd, capture_output=True, text=True, timeout=2)
+		except (subprocess.TimeoutExpired, FileNotFoundError):
+			continue
+		if arp.stdout:
+			arpOutput = arp.stdout
+			break
+
+	if not arpOutput:
+		return None
+
+	mac = re.search(MAC_PATTERN, arpOutput, re.IGNORECASE)
+	if not mac:
+		return None
+	return normalizeMac(mac.groups()[0])
+
+def normalizeMac(mac):
+	if not mac:
+		return None
+	parts = mac.strip().lower().replace('-', ':').split(':')
+	if len(parts) != 6:
+		return None
+	try:
+		return ':'.join(f'{int(part, 16):02x}' for part in parts)
+	except ValueError:
+		return None
+
+def macVariants(mac):
+	normalized = normalizeMac(mac)
+	if not normalized:
+		return set()
+
+	variants = {normalized}
+	parts = normalized.split(':')
+	firstOctet = int(parts[0], 16)
+	# Some devices flip the "locally administered" bit between AP/client modes.
+	flipped = firstOctet ^ 0x02
+	variants.add(':'.join([f'{flipped:02x}'] + parts[1:]))
+	return variants
+
+def macsMatch(left, right):
+	leftVariants = macVariants(left)
+	rightVariants = macVariants(right)
+	if not leftVariants or not rightVariants:
+		return False
+	return len(leftVariants.intersection(rightVariants)) > 0
+
+def findIPInNeighborTable(target_mac, interface = None):
+	target_mac = normalizeMac(target_mac)
+	if not target_mac:
+		return None
+	targetMacVariants = macVariants(target_mac)
+
+	neighborCommands = []
+	if interface:
+		neighborCommands.append(['ip', 'neigh', 'show', 'dev', interface])
+	neighborCommands.extend([
+		['ip', 'neigh', 'show'],
+		['arp', '-an'],
+		['arp', '-a']
+	])
+
+	for cmd in neighborCommands:
+		try:
+			result = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+		except (subprocess.TimeoutExpired, FileNotFoundError):
+			continue
+
+		if not result.stdout:
+			continue
+
+		for line in result.stdout.splitlines():
+			ipMatch = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
+			macMatch = re.search(MAC_PATTERN, line, re.IGNORECASE)
+			if not ipMatch or not macMatch:
+				continue
+			normalized = normalizeMac(macMatch.group(1))
+			if normalized and normalized in targetMacVariants:
+				return ipMatch.group(1)
+
+	return None
+
+def scanWithArpScan(target_mac):
+	target_mac = normalizeMac(target_mac)
+	if not target_mac:
+		return None
+
+	arpScanPath = shutil.which('arp-scan')
+	if not arpScanPath:
+		return None
+
+	try:
+		result = subprocess.run([arpScanPath, '--localnet', '--ignoredups'], capture_output=True, text=True, timeout=12)
+	except subprocess.TimeoutExpired:
+		return None
+
+	if result.returncode != 0:
+		stderr = result.stderr.strip()
+		if stderr:
+			print(f'arp-scan failed: {stderr}')
+		return None
+
+	for line in result.stdout.splitlines():
+		match = re.search(rf"^(\d+\.\d+\.\d+\.\d+)\s+{MAC_PATTERN}", line, re.IGNORECASE)
+		if match and macsMatch(match.group(2), target_mac):
+			return match.group(1)
+
+	return None
+
+def probeAddressForMac(addr):
+	return addr, getMacAddress(addr)
+
+def getLocalNetworkContext():
+	try:
+		route = subprocess.run(['ip', '-4', 'route', 'get', '1.1.1.1'], capture_output=True, text=True, timeout=2)
+		line = route.stdout.strip()
+		if route.returncode == 0 and line:
+			devMatch = re.search(r"\bdev\s+(\S+)", line)
+			srcMatch = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", line)
+			if srcMatch:
+				srcIP = srcMatch.group(1)
+				parts = srcIP.split('.')
+				subnetPrefix = f'{parts[0]}.{parts[1]}.{parts[2]}'
+				return {
+					'interface': devMatch.group(1) if devMatch else None,
+					'src_ip': srcIP,
+					'subnet_prefix': subnetPrefix
+				}
+	except (subprocess.TimeoutExpired, FileNotFoundError):
+		pass
+
 	machineAddr = getMachineIP()
 	if not machineAddr:
+		return None
+	parts = machineAddr.split('.')
+	return {
+		'interface': None,
+		'src_ip': machineAddr,
+		'subnet_prefix': f'{parts[0]}.{parts[1]}.{parts[2]}'
+	}
+
+def findInvokeIP(target_mac, deadline = None):
+	if not target_mac:
+		return None
+	target_mac = normalizeMac(target_mac)
+	if not target_mac:
+		print('Invoke MAC is invalid.')
+		return None
+	print(f'Looking for Invoke MAC: {target_mac} (accepted variants: {sorted(macVariants(target_mac))})')
+
+	networkContext = getLocalNetworkContext()
+	if not networkContext:
 		print('Failed to get machine IP address.')
 		return None
 
-	machineAddr = machineAddr.split('.')
-	machineAddr = f'{machineAddr[0]}.{machineAddr[1]}.{machineAddr[2]}'
-	i = 0
-	while i <= 255:
-		addr = f'{machineAddr}.{i}'
-		if getMacAddress(addr) == target_mac:
-			return addr
-		i += 1
+	interface = networkContext['interface']
+	subnetPrefix = networkContext['subnet_prefix']
+	print(f"Local network context: interface={interface}, ip={networkContext['src_ip']}, subnet={subnetPrefix}.0/24")
+
+	cachedIP = findIPInNeighborTable(target_mac, interface = interface)
+	if cachedIP:
+		if not cachedIP.startswith(f'{subnetPrefix}.'):
+			print(f'Ignoring cached Invoke IP from another subnet: {cachedIP}')
+		else:
+			print(f'Found Invoke in neighbor table: {cachedIP}')
+			return cachedIP
+
+	arpScanIP = scanWithArpScan(target_mac)
+	if arpScanIP:
+		if not arpScanIP.startswith(f'{subnetPrefix}.'):
+			print(f'Ignoring arp-scan Invoke IP from another subnet: {arpScanIP}')
+		else:
+			print(f'Found Invoke via arp-scan: {arpScanIP}')
+			return arpScanIP
+
+	print(f'Scanning subnet {subnetPrefix}.0/24 for Invoke MAC {target_mac}...')
+	addresses = [f'{subnetPrefix}.{i}' for i in range(1, 255)]
+	with concurrent.futures.ThreadPoolExecutor(max_workers = 48) as executor:
+		futureMap = {executor.submit(probeAddressForMac, addr): addr for addr in addresses}
+		for index, future in enumerate(concurrent.futures.as_completed(futureMap), start = 1):
+			if deadline and time.time() >= deadline:
+				print('Invoke IP search deadline reached during subnet scan.')
+				return None
+			if index % 32 == 0:
+				print(f'  - probes completed: {index}/{len(addresses)}')
+			try:
+				addr, mac = future.result()
+			except Exception:
+				continue
+			if macsMatch(mac, target_mac):
+				return addr
 
 	return None
 
@@ -212,15 +414,16 @@ def main():
 		print(f"ID: {index}, SSID: {html.unescape(network['SSID'])}, Signal Strength: {network['rssi']}, Security: {network['Security']}, band: {network['band']}")
 		index += 1
 
-	NetworkIndex = input("Enter the ID of the network you want to connect to: ")
-	NetworkIndex = int(NetworkIndex) - 1
+	#NetworkIndex = input("Enter the ID of the network you want to connect to: ")
+	NetworkIndex = 0 #int(NetworkIndex) - 1
 	if NetworkIndex < 0 or NetworkIndex >= len(networks['Items']):
 		print("Invalid network ID.")
 		exit(0)
 	network = networks['Items'][NetworkIndex]
 
 	# Enter the network password
-	password = input("Enter the network password: ")
+	#password = input("Enter the network password: ")
+	password = "FuckElonMusk69!"
 	if not password:
 		print("No password entered.")
 		exit(0)
@@ -241,30 +444,33 @@ def main():
 		r = requests.get(f'{DOMAIN}/goform/HandleCommand?CMD=RECONNECT_ACK', verify=CERT)
 		print(r.text)
 
-	connectToInvoke()
-
-	checkStatus()
-
-	checkStatus(True)
-
-	r = requests.get(f'{DOMAIN}/ConnectedStatus.asp', verify=CERT)
-	if r.status_code == 200 and r.text == 'connected':
-		print("Successfully connected to the network.")
-	else:
-		print(f"Failed to connect to the network. Status code: {r.status_code}")
-		exit(-1)
-
 	if currentNetwork:
-		print(f'Reconnect to {currentNetwork['SSID']}')
+		print(f"Reconnect to {currentNetwork['SSID']}")
 		if not connectWifi(currentNetwork):
 			print('Failed to connect to main network')
 			exit(-1)
 
-	while True:
-		invokeIP = findInvokeIP(INVOKE_MAC)
+	# Give Invoke time to leave AP mode and join the selected network.
+	time.sleep(3)
+
+	print('Looking for Invoke on local network...')
+	lookupTimeoutSeconds = 60
+	startTime = time.time()
+	deadline = startTime + lookupTimeoutSeconds
+	attempt = 1
+	while time.time() < deadline:
+		elapsed = time.time() - startTime
+		remaining = max(0.0, deadline - time.time())
+		print(f'Invoke IP lookup attempt {attempt} (elapsed: {elapsed:.1f}s, remaining: {remaining:.1f}s)')
+		invokeIP = findInvokeIP(INVOKE_MAC, deadline = deadline)
 		if invokeIP:
 			print(f'Found Invoke! Device connected at {invokeIP}')
 			break
+		attempt += 1
+		time.sleep(1)
+	else:
+		print('Timed out after 60 seconds while searching for Invoke IP.')
+		exit(-1)
 
 if __name__ == "__main__":
 	main()
