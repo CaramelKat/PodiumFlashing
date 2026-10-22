@@ -77,11 +77,12 @@ class OutStream:
 
     def fileno(self):
         return self._fileno
-    
+
 class Command:
 
-    def __init__(self, cmd, log):
+    def __init__(self, cmd, log, printer=None):
         self.cmd = cmd
+        self.printer = printer
         self.streams = None
         self.process = None
         self.lines = []
@@ -114,16 +115,19 @@ class Command:
                 if string in line:
                     return True
         return False
-    
+
     def logToBuffer(self):
         # Log to sys.stdout.buffer
         while self.streams:
             lines = self.fetchStream()
-            if not self.log:
+            if not self.log or not lines:
                 continue
 
             for line in lines:
                 if line:
+                    if self.printer:
+                        self.printer(line)
+                        continue
                     line = f"{bcolors.WARNING}{line}{bcolors.ENDC}\n"
                     sys.stdout.buffer.write(line.encode())
                     sys.stdout.buffer.flush()
@@ -132,9 +136,9 @@ class Command:
     def fetchStream(self):
         if not self.streams:
             return
-        
+
         outputLines = []
-        
+
         while True:
             try:
                 rlist, _, _ = select.select(self.streams, [], [])

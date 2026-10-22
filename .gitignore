@@ -8,3 +8,4 @@
 /Stock
 /rootfs
 .venv
+*.log

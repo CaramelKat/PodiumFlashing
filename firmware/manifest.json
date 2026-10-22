@@ -1,0 +1,14 @@
+{
+  "images": [
+    {
+      "name": "Final Stock",
+      "description": "Barracuda_libre-12.2134.0. The last release published by HK that removed Cortana support.",
+      "file": "Final_Stock_Firmware.IMAGE"
+    },
+    {
+      "name": "Rooted",
+      "description": "Barracuda_rooted_libre-11.1842.0. ADB shell is enabled, SSH is enabled with root + an empty password",
+      "file": "Rooted.IMAGE"
+    }
+  ]
+}
