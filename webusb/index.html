@@ -3,9 +3,13 @@
 <head>
 <meta charset="utf-8">
 <title>Podium Flashing</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <style>
   body { font-family: sans-serif; max-width: 50em; margin: 1em auto; padding: 0 1em; }
-  pre { background: #111; color: #ddd; height: 24em; overflow: auto; padding: .5em; }
+  pre { background: #111; color: #ddd; height: 24em; overflow: auto; padding: .5em; max-width: 100%; box-sizing: border-box; }
+  img, video, canvas, select { max-width: 100%; }
+  @media (max-width: 600px) { h1 { font-size: 1.5em; } pre { height: 16em; font-size: .8em; } }
   input[type=text] { width: 6em; }
   #cmd { width: 100%; box-sizing: border-box; font-family: monospace; }
   #stages { list-style: none; padding: 0; }
@@ -17,6 +21,15 @@
   #stages li.done::before { content: "\2713  "; }
   progress { width: 100%; }
   #note.error { color: #b00; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #121212; color: #e0e0e0; }
+    a { color: #8ab4f8; }
+    pre { background: #000; color: #ddd; border: 1px solid #333; }
+    #stages li { color: #888; }
+    #stages li.active { color: #fff; }
+    #stages li.done { color: #4c4; }
+    #note.error { color: #f66; }
+  }
 </style>
 </head>
 <body>
