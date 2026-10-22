@@ -59,6 +59,17 @@
 </details>
 
 <script>
+// WebUSB is missing in Firefox, Safari and iOS browsers, and on pages that are not served
+// over HTTPS (or localhost). Replace the page with a notice and stop the script.
+if (!navigator.usb) {
+  document.body.innerHTML = `
+    <h1>Podium Flashing</h1>
+    <p><strong>This browser can't be used for flashing.</strong></p>
+    <p>This tool needs WebUSB. Open this page in a desktop version of Chrome, Edge or Opera,
+       and make sure it is loaded over HTTPS.</p>`;
+  throw new Error('WebUSB is not supported');
+}
+
 // Port of the usb_boot host tool. The device asks for images over interrupt IN by sending
 // "i*m*g*r*q*" followed by a request byte; the host streams the image over bulk OUT.
 // The device resets and re-enumerates several times while booting, so the page keeps
@@ -674,12 +685,11 @@ $('cmd').onkeydown = e => {
   sendConsole(line);
 };
 
-navigator.usb?.addEventListener('disconnect', e => {
+navigator.usb.addEventListener('disconnect', e => {
   if (e.device === device) log('detach\n');
 });
 
 renderStages();
-if (!navigator.usb) log('WebUSB is not supported in this browser.\n');
 loadFirmwareList();
 loadBundledImages().catch(err => {
   $('status').textContent = `${err}`;
