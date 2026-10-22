@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Podium Flashing</title>
+<style>
+  body { font-family: sans-serif; max-width: 50em; margin: 1em auto; padding: 0 1em; }
+  pre { background: #111; color: #ddd; height: 24em; overflow: auto; padding: .5em; }
+  input[type=text] { width: 6em; }
+  #cmd { width: 100%; box-sizing: border-box; font-family: monospace; }
+  #stages { list-style: none; padding: 0; }
+  #stages li { padding: .2em 0; color: #888; }
+  #stages li::before { content: "\25CB  "; }
+  #stages li.active { color: #000; font-weight: bold; }
+  #stages li.active::before { content: "\25B6  "; }
+  #stages li.done { color: #080; }
+  #stages li.done::before { content: "\2713  "; }
+  progress { width: 100%; }
+  #note.error { color: #b00; }
+</style>
+</head>
+<body>
+<h1>Podium Flashing</h1>
+<p>Tool to flash 83_IMAGE to the harman/kardon Invoke Speaker</p>
+
+<ol id="instructions">
+  <li>Choose a NAND image below, or pick your own <code>83_IMAGE</code> file.</li>
+  <li>Hold down the reset button.</li>
+  <li>While holding reset, turn on the device.</li>
+  <li>Press the mute button 4 times.</li>
+  <li>Wait for the yellow light to appear, then release reset.</li>
+  <li>Click <strong>Connect &amp; flash</strong> and choose the device.</li>
+</ol>
+
+<p>
+  <label>NAND image <select id="imageSelect"></select></label>
+  <label id="customImage" hidden><input type="file" id="img83"></label>
+  <button id="start" disabled>Connect &amp; flash</button>
+  <button id="stop" disabled>Stop</button>
+  <span id="firmwareStatus"></span>
+</p>
+<p id="imageDescription"></p>
+<p><label><input type="checkbox" id="advanced"> Advanced options</label></p>
+<p id="advancedOptions" hidden>
+  VID <input type="text" id="vid" value="1286">
+  PID <input type="text" id="pid" value="8174">
+  <label><input type="checkbox" id="uboot"> U-Boot shell only (don't flash)</label>
+</p>
+<p id="status">Loading bundled images...</p>
+
+<ol id="stages"></ol>
+<progress id="progress" max="100" value="0" hidden></progress>
+<p id="note"></p>
+
+<details id="debug">
+  <summary>Debug output</summary>
+  <pre id="log"></pre>
+  <input type="text" id="cmd" placeholder="Console input (Enter to send)" disabled>
+</details>
+
+<script>
+// Port of the usb_boot host tool. The device asks for images over interrupt IN by sending
+// "i*m*g*r*q*" followed by a request byte; the host streams the image over bulk OUT.
+// The device resets and re-enumerates several times while booting, so the page keeps
+// reopening it until Stop is pressed.
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// USB endpoints (numbers only; direction is implied by the transfer function used).
+const EP_BULK_OUT = 1, EP_BULK_IN = 1, EP_INTR_OUT = 2, EP_INTR_IN = 2;
+const READ_SIZE = 0x400;
+const WRITE_BLOCK_SIZE = 0x100000;       // images are streamed in 1 MiB chunks
+const IROM_SUBCLASS = 0xff;              // device is in the boot ROM stage (bcm_erom.bin.usb)
+const IROM_ATTEMPTS = 3;                 // the first transfer after enumeration can fail
+const OPEN_ATTEMPTS = 5;
+const REQUEST_MARKER = new TextEncoder().encode('i*m*g*r*q*');
+
+// Image request codes sent by the device after the marker.
+const REQ_IGNORE = 0x01, REQ_SYSINIT = 0x02, REQ_BOOTLOADER = 0x03, REQ_DRM_EROM = 0x05;
+const SIZE_FILE_MIN_REQUEST = 0x7a;      // requests above 0x79 also record the image size (07_IMAGE)
+const EARLY_BOOT_IMAGES = ['09_IMAGE', 'sysinit.img', 'bootloader.img', 'drm_erom.img'];
+
+// Bundled images are served next to this page under images/ (see .github/workflows/pages.yml
+// and webusb/devserver.py, which both publish only the files listed below).
+// 83_IMAGE (the NAND image, ~100 MB) is always supplied by the user.
+const IMAGE_BASE = 'images/';
+const BUNDLED_IMAGES = [
+  'bcm_erom.bin.usb', 'sysinit.img', 'bootloader.img', 'drm_erom.img',
+  '08_IMAGE', '09_IMAGE', '79_IMAGE',
+];
+
+// In U-Boot shell mode the boot script (79_IMAGE) is replaced with one that stops at the prompt,
+// otherwise it would run "l2nand 83" and start flashing.
+const SKIP_SCRIPT = '#skip\n';
+const UBOOT_PROMPT = '|>';
+// The native tool writes the real bus-port path to 06_IMAGE; WebUSB cannot report it.
+const USB_PATH = '1-1';
+
+const NAND_BLOCK_BYTES = 0x20000;
+const FIRMWARE_BASE = 'firmware/';   // manifest.json plus the images it lists (stored in Git LFS)
+const CUSTOM_IMAGE = 'custom';
+const DEFAULT_VID = '1286', DEFAULT_PID = '8174';
+
+// ---------------------------------------------------------------------------
+// Shared state and helpers
+// ---------------------------------------------------------------------------
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const ubootMode = () => $('uboot').checked;
+const hex = id => parseInt($(id).value, 16);
+
+const images = new Map();         // file name -> Blob (bundled images are held in memory)
+const generatedSizes = new Map(); // 07_IMAGE contents: size of the last >=0x7a image
+const decoder = new TextDecoder();
+const encoder = new TextEncoder();
+
+let bundledReady = false;
+let firmwareList = [];            // entries from firmware/manifest.json: { name, file, description }
+let downloadToken = 0;            // identifies the latest firmware download, so stale ones are dropped
+let device = null;                // the USB device currently being served
+let stopped = true;
+let sendingImage = false;         // image requests are ignored while one is being sent
+let promptSeen = false;
+let logRelay = Promise.resolve();
+
+// ---------------------------------------------------------------------------
+// Debug log
+// ---------------------------------------------------------------------------
+
+function log(text) {
+  const logEl = $('log');
+  logEl.textContent += text;
+  logEl.scrollTop = logEl.scrollHeight;
+  if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+    // Dev server only. Chained so lines reach it in order.
+    logRelay = logRelay.then(() => fetch('/__log', { method: 'POST', body: text })).catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Progress display
+// ---------------------------------------------------------------------------
+
+// Stages only move forward, because the device resets and repeats early steps while booting.
+const FLASH_STAGES = [
+  ['connect', 'Connect to device'],
+  ['irom', 'Load boot ROM'],
+  ['init', 'Initialize hardware'],
+  ['uboot', 'Start U-Boot'],
+  ['upload', 'Upload NAND image'],
+  ['erase', 'Erase NAND'],
+  ['write', 'Write and verify partitions'],
+  ['done', 'Finished'],
+];
+const SHELL_STAGES = [
+  ['connect', 'Connect to device'],
+  ['irom', 'Load boot ROM'],
+  ['init', 'Initialize hardware'],
+  ['uboot', 'Start U-Boot'],
+  ['shell', 'U-Boot shell ready'],
+];
+const FINAL_STAGES = ['done', 'shell'];
+const PROGRESS_STAGES = ['upload', 'write'];
+
+const progress = {
+  stages: FLASH_STAGES,
+  index: -1,
+  finished: false,
+  partition: null,       // partition currently being written: { name, start, size } in bytes
+  badBlocks: 0,
+  consoleBuffer: '',     // recent console text, for matching patterns split across chunks
+};
+
+function renderStages() {
+  $('stages').replaceChildren(...progress.stages.map(([, label], i) => {
+    const li = document.createElement('li');
+    li.textContent = label;
+    if (progress.finished || i < progress.index) li.className = 'done';
+    else if (i === progress.index) li.className = 'active';
+    return li;
+  }));
+}
+
+function advance(key) {
+  const i = progress.stages.findIndex(([k]) => k === key);
+  if (i < 0 || i <= progress.index || progress.finished) return;
+  progress.index = i;
+  progress.finished = FINAL_STAGES.includes(key);
+  $('progress').hidden = !PROGRESS_STAGES.includes(key);
+  $('progress').value = 0;
+  renderStages();
+}
+
+function setNote(text, isError = false) {
+  $('note').textContent = text;
+  $('note').className = isError ? 'error' : '';
+}
+
+function setProgress(done, total, what) {
+  $('progress').hidden = false;
+  $('progress').max = total;
+  $('progress').value = done;
+  setNote(`${what}: ${Math.floor(100 * done / total)}%`);
+}
+
+function resetProgress() {
+  progress.stages = ubootMode() ? SHELL_STAGES : FLASH_STAGES;
+  progress.index = -1;
+  progress.finished = false;
+  progress.partition = null;
+  progress.badBlocks = 0;
+  progress.consoleBuffer = '';
+  $('progress').hidden = true;
+  setNote('');
+  renderStages();
+}
+
+// Patterns are matched against the device console text. Each must only match complete tokens,
+// because the output arrives in arbitrary chunks.
+const CONSOLE_PATTERNS = [
+  [/U-Boot 20\d\d/, () => advance('uboot')],
+
+  [/Erase NAND chip/, () => {
+    advance('erase');
+    setNote('Erasing NAND...');
+  }],
+
+  [/Bad block found @ 0x[0-9A-Fa-f]+\./, () => {
+    progress.badBlocks++;
+  }],
+
+  // "burn rootfs, image size 81420288, partition start:329, size 720, ..." (start/size in blocks)
+  [/burn ([\w-]+), image size \d+, partition start:(\d+), size (\d+),/, m => {
+    advance('write');
+    progress.partition = {
+      name: m[1],
+      start: Number(m[2]) * NAND_BLOCK_BYTES,
+      size: Number(m[3]) * NAND_BLOCK_BYTES,
+    };
+    setProgress(0, progress.partition.size, `Writing ${progress.partition.name}`);
+  }],
+
+  [/writing NAND at address 0x([0-9A-Fa-f]{9})/, m => {
+    const p = progress.partition;
+    if (!p) return;
+    const written = parseInt(m[1], 16) - p.start + NAND_BLOCK_BYTES;
+    setProgress(Math.min(p.size, written), p.size, `Writing ${p.name}`);
+  }],
+
+  [/Congratulations! u2nand succeed/, () => {
+    advance('done');
+    const skipped = progress.badBlocks ? ` (${progress.badBlocks} bad blocks skipped)` : '';
+    setNote(`Flashing complete. You can now reboot the device.${skipped}`);
+  }],
+
+  [/MV88DE3100\|>/, () => {
+    if (!ubootMode()) return;
+    advance('shell');
+    setNote('Use the console under Debug output.');
+  }],
+];
+
+// Feeds console text to the patterns, consuming each match so it is handled only once.
+function trackConsole(text) {
+  progress.consoleBuffer += text;
+  for (;;) {
+    let best = null;
+    for (const [pattern, handler] of CONSOLE_PATTERNS) {
+      const m = pattern.exec(progress.consoleBuffer);
+      if (m && (!best || m.index < best.m.index)) best = { m, handler };
+    }
+    if (!best) break;
+    best.handler(best.m);
+    progress.consoleBuffer = progress.consoleBuffer.slice(best.m.index + best.m[0].length);
+  }
+  progress.consoleBuffer = progress.consoleBuffer.slice(-200);
+}
+
+// ---------------------------------------------------------------------------
+// Image loading and generation
+// ---------------------------------------------------------------------------
+
+function updateStartButton() {
+  $('start').disabled = !(bundledReady && (ubootMode() || images.has('83_IMAGE')));
+  $('imageSelect').disabled = ubootMode();
+  $('img83').disabled = ubootMode();
+}
+
+// ---------------------------------------------------------------------------
+// NAND image selection (83_IMAGE): hosted firmware list or a user-supplied file
+// ---------------------------------------------------------------------------
+
+function addOption(select, value, label) {
+  const option = document.createElement('option');
+  option.value = value;
+  option.textContent = label;
+  select.append(option);
+}
+
+async function loadFirmwareList() {
+  const select = $('imageSelect');
+  addOption(select, '', 'Select an image...');
+  try {
+    const res = await fetch(FIRMWARE_BASE + 'manifest.json');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    firmwareList = (await res.json()).images;
+    firmwareList.forEach((entry, i) => addOption(select, String(i), entry.name));
+  } catch (err) {
+    log(`firmware list unavailable: ${err}\n`);
+  }
+  addOption(select, CUSTOM_IMAGE, 'Choose my own file...');
+}
+
+// Reads the response body in pieces so progress can be shown for the ~100 MB download.
+async function fetchWithProgress(url, onProgress) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const total = Number(res.headers.get('Content-Length')) || 0;
+  const chunks = [];
+  let received = 0;
+  const reader = res.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    onProgress(received, total);
+  }
+  return new Blob(chunks);
+}
+
+async function downloadFirmware(entry) {
+  const token = ++downloadToken;
+  const status = $('firmwareStatus');
+  try {
+    const blob = await fetchWithProgress(FIRMWARE_BASE + entry.file, (received, total) => {
+      const mb = (received / 1048576).toFixed(1);
+      status.textContent = total ? `Downloading ${Math.floor(100 * received / total)}%` : `Downloading ${mb} MB`;
+    });
+    if (token !== downloadToken) return;
+    // A file that was not fetched from Git LFS is only a small text pointer.
+    if (blob.size < 1024 && (await blob.text()).startsWith('version https://git-lfs')) {
+      throw new Error('this is a Git LFS pointer, not the image (LFS files were not fetched)');
+    }
+    images.set('83_IMAGE', blob);
+    status.textContent = `Ready (${(blob.size / 1048576).toFixed(1)} MB)`;
+  } catch (err) {
+    if (token !== downloadToken) return;
+    status.textContent = `Download failed: ${err}`;
+  }
+  updateStartButton();
+}
+
+$('imageSelect').onchange = e => {
+  const choice = e.target.value;
+  downloadToken++;                       // abandon any download in progress
+  images.delete('83_IMAGE');
+  $('img83').value = '';
+  $('firmwareStatus').textContent = '';
+  $('customImage').hidden = choice !== CUSTOM_IMAGE;
+  const entry = firmwareList[Number(choice)];
+  $('imageDescription').textContent = (choice !== '' && entry && entry.description) || '';
+  if (choice !== '' && choice !== CUSTOM_IMAGE) downloadFirmware(firmwareList[Number(choice)]);
+  updateStartButton();
+};
+
+async function loadBundledImages() {
+  for (const name of BUNDLED_IMAGES) {
+    const res = await fetch(IMAGE_BASE + name);
+    if (!res.ok) throw new Error(`failed to fetch ${name}: HTTP ${res.status}`);
+    images.set(name, await res.blob());
+  }
+  bundledReady = true;
+  $('status').textContent =
+    `${BUNDLED_IMAGES.length} bundled images loaded. Choose a NAND image to continue.`;
+  updateStartButton();
+}
+
+// Images that the native tool takes from IMAGE_DIR files it writes itself are generated here.
+function generatedImage(name) {
+  if (name === '79_IMAGE' && ubootMode()) return new Blob([SKIP_SCRIPT]);
+  if (name === '06_IMAGE') return new Blob([USB_PATH, '\0']);
+  if (name === '07_IMAGE' && generatedSizes.has('07_IMAGE')) {
+    const size = new DataView(new ArrayBuffer(4));
+    size.setUint32(0, generatedSizes.get('07_IMAGE'), true);
+    return new Blob([size.buffer]);
+  }
+  return null;
+}
+
+function imageNameForRequest(code) {
+  switch (code) {
+    case REQ_SYSINIT: return 'sysinit.img';
+    case REQ_BOOTLOADER: return 'bootloader.img';
+    case REQ_DRM_EROM: return 'drm_erom.img';
+    default: return code.toString(16).padStart(2, '0') + '_IMAGE';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sending images (bulk OUT)
+// ---------------------------------------------------------------------------
+
+async function writeImage(file, withHeader, onProgress) {
+  if (withHeader) {
+    // Header: 32-bit little-endian image size; the remaining 4 bytes are unused (zero).
+    // The boot ROM stage takes the raw image without it.
+    const header = new DataView(new ArrayBuffer(8));
+    header.setUint32(0, file.size, true);
+    log(`sending image header package, size ${file.size}\n`);
+    await device.transferOut(EP_BULK_OUT, header.buffer);
+  }
+
+  let sent = 0;
+  while (sent < file.size && !stopped) {
+    const chunk = await file.slice(sent, sent + WRITE_BLOCK_SIZE).arrayBuffer();
+    const res = await device.transferOut(EP_BULK_OUT, chunk);
+    if (res.status !== 'ok') throw new Error(`bulk OUT status ${res.status}`);
+    sent += res.bytesWritten;
+    log(`actual data wrote ${res.bytesWritten}, total_data_wrote ${sent}\n`);
+    if (onProgress) onProgress(sent, file.size);
+  }
+}
+
+// Returns true if the image was sent. With `quiet`, a failure is not reported (the caller retries).
+async function sendImage(name, code, { withHeader = true, quiet = false } = {}) {
+  const file = generatedImage(name) || images.get(name);
+  if (!file) {
+    log(`failed to open image file ${name}\n`);
+    return false;
+  }
+  if (code >= SIZE_FILE_MIN_REQUEST) {
+    generatedSizes.set('07_IMAGE', file.size);
+    log(`requested image size ${file.size} (07_IMAGE)\n`);
+  }
+
+  if (EARLY_BOOT_IMAGES.includes(name)) advance('init');
+  let onProgress = null;
+  if (name === '83_IMAGE') {
+    advance('upload');
+    onProgress = (done, total) => setProgress(done, total, 'Uploading NAND image');
+  }
+
+  sendingImage = true;
+  try {
+    await writeImage(file, withHeader, onProgress);
+    return true;
+  } catch (err) {
+    if (!quiet) {
+      log(`Error, write image failed: ${err}\n`);
+      setNote(`Error sending ${name}: ${err}`, true);
+    }
+    return false;
+  } finally {
+    sendingImage = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Receiving console output and image requests (interrupt IN)
+// ---------------------------------------------------------------------------
+
+function indexOfMarker(bytes) {
+  outer: for (let i = 0; i + REQUEST_MARKER.length < bytes.length; i++) {
+    for (let j = 0; j < REQUEST_MARKER.length; j++) {
+      if (bytes[i + j] !== REQUEST_MARKER[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+// Strips image requests from the console stream, serves them, and returns the text to display.
+function processReceived(bytes) {
+  let data = bytes;
+  for (let i = indexOfMarker(data); i >= 0; i = indexOfMarker(data)) {
+    const code = data[i + REQUEST_MARKER.length];
+    if (code !== REQ_IGNORE && !sendingImage) {
+      const name = imageNameForRequest(code);
+      log(`received request from dongle to send image ${name}.\n`);
+      sendImage(name, code);
+    }
+    // Remove the marker and request byte.
+    const rest = new Uint8Array(data.length - REQUEST_MARKER.length - 1);
+    rest.set(data.subarray(0, i));
+    rest.set(data.subarray(i + REQUEST_MARKER.length + 1), i);
+    data = rest;
+  }
+  return decoder.decode(data);
+}
+
+function handleConsoleData(bytes) {
+  const text = processReceived(bytes);
+  log(text);
+  trackConsole(text);
+  // In shell mode, a carriage return at the first prompt makes the prompt reappear for the user.
+  if (ubootMode() && !promptSeen && text.includes(UBOOT_PROMPT)) {
+    promptSeen = true;
+    sendConsole('\r');
+  }
+}
+
+async function readLoop(dev, endpoint, handler) {
+  while (!stopped && dev === device) {
+    const res = await dev.transferIn(endpoint, READ_SIZE);
+    if (res.status === 'stall') {
+      log(`endpoint ${endpoint} stalled, clearing halt\n`);
+      await dev.clearHalt('in', endpoint);
+      continue;
+    }
+    if (res.data && res.data.byteLength) {
+      handler(new Uint8Array(res.data.buffer, res.data.byteOffset, res.data.byteLength));
+    }
+  }
+}
+
+async function sendConsole(text) {
+  if (!device) return;
+  const res = await device.transferOut(EP_INTR_OUT, encoder.encode(text));
+  log(`actual data wrote ${res.bytesWritten}\n`);
+}
+
+// ---------------------------------------------------------------------------
+// Device sessions
+// ---------------------------------------------------------------------------
+
+async function openDevice(dev) {
+  // The device is still enumerating right after it appears (the native tool also waits 1 s).
+  await sleep(1000);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await dev.open();
+      if (dev.configuration === null) await dev.selectConfiguration(1);
+      await dev.claimInterface(0);
+      return;
+    } catch (err) {
+      if (attempt >= OPEN_ATTEMPTS || stopped) throw err;
+      log(`open failed (${err}), retrying\n`);
+      try { await dev.close(); } catch (e) { /* not open */ }
+      await sleep(1000);
+    }
+  }
+}
+
+// Boot ROM stage: send bcm_erom.bin.usb, after which the device restarts.
+async function serveBootRom() {
+  log('iROM stage dongle connected.\n');
+  advance('irom');
+  setNote('Sending boot ROM...');
+  for (let attempt = 1; attempt <= IROM_ATTEMPTS; attempt++) {
+    const lastAttempt = attempt === IROM_ATTEMPTS;
+    const sent = await sendImage('bcm_erom.bin.usb', 0, { withHeader: false, quiet: !lastAttempt });
+    if (sent) break;
+    if (!lastAttempt) await sleep(500);
+  }
+  log('iROM image sent, waiting for device to restart\n');
+  setNote('Boot ROM sent, waiting for the device to restart...');
+}
+
+// Later stages: answer image requests and show console output until the device goes away.
+async function serveBootStage(dev) {
+  $('cmd').disabled = false;
+  log('one target device connected.\n\r');
+  await Promise.all([
+    readLoop(dev, EP_BULK_IN, bytes => log(`actual data received ${bytes.length}\n`)),
+    readLoop(dev, EP_INTR_IN, handleConsoleData),
+  ]);
+}
+
+// Serves one USB session. Returns when the device goes away or the session ends.
+async function serve(dev) {
+  device = dev;
+  promptSeen = false;
+  sendingImage = false;
+  await openDevice(dev);
+  log(`claimed interface, sub_class: ${dev.deviceSubclass}\n`);
+  advance('connect');
+  setNote('');
+
+  try {
+    if (dev.deviceSubclass === IROM_SUBCLASS) await serveBootRom();
+    else await serveBootStage(dev);
+  } catch (err) {
+    if (!stopped) log(`${err}\n`);
+  } finally {
+    $('cmd').disabled = true;
+    try { await dev.releaseInterface(0); } catch (e) { /* already gone */ }
+    try { await dev.close(); } catch (e) { /* already gone */ }
+    log('target device disconnected.\n\r');
+    if (device === dev) device = null;
+  }
+}
+
+function matchesFilter(dev) {
+  return dev.vendorId === hex('vid') && dev.productId === hex('pid');
+}
+
+// Previously granted devices can be reopened without a new prompt, so poll for the next appearance.
+async function waitForDevice() {
+  while (!stopped) {
+    const dev = (await navigator.usb.getDevices()).find(matchesFilter);
+    if (dev && !dev.opened) return dev;
+    await sleep(500);
+  }
+  return null;
+}
+
+async function start() {
+  const first = await navigator.usb.requestDevice({
+    filters: [{ vendorId: hex('vid'), productId: hex('pid') }],
+  });
+  stopped = false;
+  resetProgress();
+  $('debug').open = ubootMode();
+  $('start').disabled = true;
+  $('stop').disabled = false;
+
+  for (let dev = first; dev && !stopped; dev = await waitForDevice()) {
+    await serve(dev);
+    if (stopped) break;
+    log('waiting for device to reconnect...\n');
+    if (!progress.finished) setNote('Device is restarting, waiting for it to reconnect...');
+    await sleep(1000); // let the old device node disappear before looking for the new one
+  }
+
+  log('stopped\n');
+  $('stop').disabled = true;
+  updateStartButton();
+}
+
+// ---------------------------------------------------------------------------
+// Page wiring
+// ---------------------------------------------------------------------------
+
+$('uboot').onchange = updateStartButton;
+
+// Hiding the advanced options also restores their defaults, so a hidden setting never applies.
+$('advanced').onchange = e => {
+  $('advancedOptions').hidden = !e.target.checked;
+  if (e.target.checked) return;
+  $('vid').value = DEFAULT_VID;
+  $('pid').value = DEFAULT_PID;
+  $('uboot').checked = false;
+  updateStartButton();
+};
+
+$('img83').onchange = e => {
+  const file = e.target.files[0];
+  if (file) images.set('83_IMAGE', file);
+  else images.delete('83_IMAGE');
+  updateStartButton();
+};
+
+$('start').onclick = () => start().catch(err => {
+  stopped = true;
+  $('stop').disabled = true;
+  updateStartButton();
+  log(`${err}\n`);
+  setNote(`${err}`, true);
+});
+
+$('stop').onclick = () => {
+  stopped = true;
+  if (device) device.close().catch(() => {});
+};
+
+$('cmd').onkeydown = e => {
+  if (e.key !== 'Enter' || stopped) return;
+  const line = e.target.value + '\n';
+  e.target.value = '';
+  sendConsole(line);
+};
+
+navigator.usb?.addEventListener('disconnect', e => {
+  if (e.device === device) log('detach\n');
+});
+
+renderStages();
+if (!navigator.usb) log('WebUSB is not supported in this browser.\n');
+loadFirmwareList();
+loadBundledImages().catch(err => {
+  $('status').textContent = `${err}`;
+});
+</script>
+</body>
+</html>
