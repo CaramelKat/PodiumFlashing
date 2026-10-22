@@ -1,2 +1,2 @@
 #!/bin/bash
-sudo ./.venv/bin/python ./imager.py "$@"
+sudo python ./imager.py "$@"
