@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "invoke-fw"
+version = "0.1.0"
+description = "Read, patch and rebuild Harman Kardon Invoke 83_IMAGE firmware files"
+requires-python = ">=3.8"
+
+[project.scripts]
+invoke-fw = "invoke_fw.__main__:cli"
+
+[tool.setuptools]
+packages = ["invoke_fw"]

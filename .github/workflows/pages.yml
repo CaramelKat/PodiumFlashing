@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - webusb/index.html
+      - webusb/squashfs.js
+      - webusb/patch.js
       - firmware/**
       - marvell_flash_tool/**
       - .github/workflows/pages.yml
@@ -35,7 +37,7 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p _site/images
-          cp webusb/index.html _site/
+          cp webusb/index.html webusb/squashfs.js webusb/patch.js _site/
           cp -r firmware _site/firmware
           for name in bcm_erom.bin.usb sysinit.img bootloader.img drm_erom.img 08_IMAGE 09_IMAGE 79_IMAGE; do
             cp "marvell_flash_tool/$name" "_site/images/$name"

@@ -9,3 +9,14 @@
 /rootfs
 .venv
 *.log
+__pycache__/
+.DS_Store
+# compiled output
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+*.elf
+*.pyc
+/usb_boot_cpp/build/
