@@ -6,16 +6,14 @@ import atexit
 import pexpect
 import shutil
 import argparse
-import zlib
 import traceback
 
 from pathlib import Path
 from enum import Enum
 from processRunner import Command
+from invoke_fw import BLOCK_SIZE, ImageError, load_image
 
 EXTRACTION_PATH = './ExtractedImage'
-
-BLOCK_SIZE = 131072
 
 SKIP_SCRIPT = b'#skip\n'
 
@@ -100,218 +98,33 @@ class Commands(Enum):
     def __str__(self):
         return self.value
 
-class Region():
-
-    def __init__(self, name: str, bytes: bytes | None, bufferStart: int, imageSize: int, imagePath: Path, CRC32: bytes, unk2: bytes, partitionStart: int, partitionSize: int):
-        self.name: str = name
-        self.bytes = bytes
-        self.imageSize: int = imageSize
-        self.CRC32 = CRC32
-        self.unk2 = unk2
-        self.start: int = partitionStart
-        self.partitionSize: int = partitionSize
-        self.bufferStart: int = bufferStart
-
-        self.path: Path = imagePath
-
-    def __str__(self):
-        return "| {:16s} | {:8s} {:11s} | {:8s} |  {:4s} | {:4s} {:11s} |".format(self.name,
-            str(self.imageSize),
-            '(' + str(round(self.imageSize * 0.00000095367432, 3)) + ' MB)',
-            self.CRC32.hex(),
-            str(self.start),
-            str(self.partitionSize),
-            '(' + str(round((self.partitionSize * BLOCK_SIZE) * 0.00000095367432, 3)) + ' MB)')
-
-    def extractImage(self):
-        filePath = Path(EXTRACTION_PATH, f'{self.name}.bin')
-        with open(self.path, 'rb') as file:
-            fileBytes = file.read()
-            imageBuffer = fileBytes[self.bufferStart:self.bufferStart+self.imageSize]
-            with open(filePath, 'wb') as w:
-                w.write(imageBuffer)
-                w.close()
-            file.close()
-            return True
-
-    def updateImage(self):
-        filePath = Path(EXTRACTION_PATH, f'{self.name}.bin')
-        if not self.CRC32 or not self.bytes:
-            return True
-        print('Old image size:', self.imageSize)
-        print(self.bytes.hex())
-        
-        with open(filePath, 'rb') as file:
-            imageBuffer = file.read()
-            newCRC32 = zlib.crc32(imageBuffer).to_bytes(4)
-            fileSize = filePath.stat().st_size
-            maxSize = self.partitionSize * BLOCK_SIZE
-            if fileSize > maxSize:
-                print(f'Error! Image size is too big! Must be at most {maxSize}. Is currently {fileSize}')
-                file.close()
-                return False
-
-            self.imageSize = fileSize
-            self.CRC32 = newCRC32
-            self.actualLength = fileSize
-            self.bytes = self.bytes[:16] + self.imageSize.to_bytes(4, 'little') + self.bytes[20:24] + newCRC32[::-1] + self.bytes[28:]
-            print('New image size:', self.imageSize)
-            print(self.bytes.hex())
-            return True
-
-class InvokeImage():
-
-    def __init__(self, imagePath: Path):
-        self.path: Path = imagePath
-        self.header = None
-        self.numRegions = -1
-        self.regions: list[Region] = []
-
-        Path(EXTRACTION_PATH).mkdir(parents=True, exist_ok=True) 
-        self.initImage()
-
-    def __str__(self):
-        temp = []
-        for region in self.regions:
-            temp.append(str(region))
-        return str({
-            "path": self.path,
-            "regions": temp
-        })
-
-    def printRegions(self):
-        print('| Name             | Img Size             | CRC      | Start | Partition Size   |')
-        print('| ---------------- + -------------------- + -------- + ----- + ---------------- |')
-        for region in self.regions:
-            print(region)
-        print('| ---------------- | -------------------- | -------- | ----- | ---------------- |')
-
-    def getRegion(self, name):
-        return next((region for region in self.regions if region.name == name ), None)
-
-    def initImage(self):
-        fileBytes = b''
-
-        with open(self.path, 'rb') as file:
-            fileBytes = file.read()
-
-        magicKey         = fileBytes[0:4]    # F1 A3 AD D2
-        unk1             = fileBytes[0:2]    # 4A 08 ?
-        unk2             = fileBytes[13]     # Unknown 1 byte - 0x08 / 8
-        unk3             = fileBytes[20]     # Unknown 2 byte - 0x40 / 64
-        unk4             = fileBytes[25]     # Unknown 3 byte - 0x08 / 8
-        self.numRegions  = fileBytes[28]     # number regions - 0x09 / 9
-        unk5             = fileBytes[32:35]  # Unknown 3 bytes - 23 41 30
-
-        if magicKey != b'\xf1\xa3\xad\xd2':
-            raise Exception("Magic key doesn't match! Unknown Image format!")
-
-        self.header = fileBytes[0:64]
-
-        offset = 64
-        imageOffset = 640
-        for i in range(0, self.numRegions):
-            regionBuffer = fileBytes[offset:offset+64]
-            # 8, 64, 8?
-            # 8 bytes of padding before and after, each section is 64 bytes apart?
-            sectionName = regionBuffer[0:16].decode("utf-8").rstrip('\x00') # Variable length, max 16 bytes
-            imageSize = int.from_bytes(regionBuffer[16:20], 'little') # Actual image size
-            CRC = regionBuffer[24:28][::-1] # CRC32
-            unk2 = regionBuffer[32:36] # Always 0x1ef03301
-            Start = int.from_bytes(regionBuffer[40:42], 'little') # Partition start? UBoot logs this, doesn't line up with the addresses so idk
-            Size = int.from_bytes(regionBuffer[44:46], 'little') # Allocated partition size, not necessarily size of image
-
-            region: Region = Region(name=sectionName, bytes=regionBuffer, bufferStart=imageOffset, imageSize=imageSize, imagePath=self.path, CRC32=CRC, unk2=unk2, partitionStart=Start, partitionSize=Size)
-            self.regions.append(region)
-
-            offset += 64
-            imageOffset += imageSize
-
-        # Manually add footer
-        region: Region = Region(name='footer', bytes=None, bufferStart=imageOffset, imageSize=(len(fileBytes) - imageOffset), imagePath=self.path, CRC32=bytes(), unk2=bytes(), partitionStart=0, partitionSize=0)
-        self.regions.append(region)
-
-    def extractImage(self, name=None):
-        if name:
-            region = next((region for region in self.regions if region.name == name), None)
-            if not region:
-                return
-
-            return region.extractImage()
-
-        for region in self.regions:
-            if not region.extractImage():
-                print('Failed to extract', region.name, '!!!')
-        # Copy image to extraction directory
-        imagePath = Path(EXTRACTION_PATH, '83_IMAGE')
-        shutil.copy(self.path, imagePath)
-        return True
-
-    def buildImage(self):
-        # Start rebuilding the header
-        fileBuffer = bytearray()
-        imagesBuffer = bytearray()
-
-        if not self.header:
-            print(f'Error! Failed to build image due to missing header!')
-            return False
-
-        fileBuffer.extend(self.header)
-
-        for region in self.regions:
-            filePath = Path(EXTRACTION_PATH, f'{region.name}.bin')
-
-            if not filePath.exists():
-                print(f'Error! Failed to build image on region {region.name}!')
-                return False
-
-            with open(filePath, 'rb') as file:
-                image = file.read()
-
-                CRC32 = zlib.crc32(image).to_bytes(4)
-                if CRC32 != region.CRC32 and region.CRC32 != b'':
-                    print(f'Updating {region.name} new: {CRC32.hex()} old: {region.CRC32.hex()}')
-                    region.updateImage()
-
-                if region.bytes:
-                    fileBuffer.extend(region.bytes)
-
-                if region.name != 'header':
-                    imagesBuffer.extend(image)
-
-                file.close()
-
-        fileBuffer.extend(imagesBuffer)
-        newImagePath = Path(EXTRACTION_PATH, '83_IMAGE_REBUILT')
-        with open(newImagePath, 'wb') as w:
-            w.write(fileBuffer)
-            w.close()
-            return True
-
-def extractImage(image: InvokeImage):
+def extractImage(path: Path):
     print(f'Extracting image to {EXTRACTION_PATH}')
-    if image.extractImage():
-        print('Parsed regions:')
-        image.printRegions()
-        print('Extraction complete!')
-    else:
-        print('Failed to extract image!')
-        exit(1)
+    image = load_image(path)
+    image.extract_to(EXTRACTION_PATH)
+    # The original image is kept as the template that build uses for the header and region table
+    shutil.copy(path, Path(EXTRACTION_PATH, '83_IMAGE'))
+    print('Parsed regions:')
+    print(image.table())
+    print('Extraction complete!')
 
-def buildImage(image: InvokeImage):
-    if not any(Path(EXTRACTION_PATH).iterdir()):
+def buildImage(path: Path):
+    if not Path(EXTRACTION_PATH).exists() or not any(Path(EXTRACTION_PATH).iterdir()):
         print('Image has not been extracted yet!')
         exit(1)
 
     print('Building image...')
-    if image.buildImage():
-        print('Generated regions:')
-        image.printRegions()
-        print('Build complete!')
-        return True
-    else:
-        print('Failed to build image!')
+    try:
+        image = load_image(path)
+        for name in image.load_dir(EXTRACTION_PATH):
+            print(f'Updating {name}')
+        image.save(Path(EXTRACTION_PATH, '83_IMAGE_REBUILT'))
+    except ImageError as error:
+        print(f'Failed to build image! {error}')
         exit(2)
+    print('Generated regions:')
+    print(image.table())
+    print('Build complete!')
 
 def uboot_input_filter():
     # U-Boot doesn't echo over this link and the pty echo is disabled, so echo locally and map DEL to ^H.
@@ -507,20 +320,15 @@ def main(args):
         print(f'Error! {args.path} was not found!')
         exit(4)
 
-    image = InvokeImage(args.path) if args.path else None
-
     match args.command:
         case Commands.extract:
-            if not image:
+            if not args.path:
                 print('Error! Image does not exist')
                 return
-            extractImage(image)
+            extractImage(args.path)
 
         case Commands.build:
-            if not image:
-                print('Error! Image does not exist')
-                return
-            buildImage(image)
+            buildImage(args.path)
 
         case Commands.clean:
             shutil.rmtree(EXTRACTION_PATH)
@@ -536,11 +344,8 @@ def main(args):
             flashImage(args.path, args.verbose, args.log_file, args.uboot_shell)
 
         case Commands.quickBuild:
-            if not image:
-                print('Error! Image does not exist')
-                return
             packFS()
-            buildImage(image)
+            buildImage(args.path)
             flashImage(Path(EXTRACTION_PATH, '83_IMAGE_REBUILT'), args.verbose, args.log_file)
 
 if __name__ == "__main__":
