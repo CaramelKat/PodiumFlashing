@@ -11,6 +11,7 @@
   img, video, canvas, select { max-width: 100%; }
   @media (max-width: 600px) { h1 { font-size: 1.5em; } pre { height: 16em; font-size: .8em; } }
   input[type=text] { width: 6em; }
+  #wifiSsid, #wifiPassword, #deviceName { width: 12em; }
   #cmd { width: 100%; box-sizing: border-box; font-family: monospace; }
   #stages { list-style: none; padding: 0; }
   #stages li { padding: .2em 0; color: #888; }
@@ -53,6 +54,24 @@
   <span id="firmwareStatus"></span>
 </p>
 <p id="imageDescription"></p>
+<details id="wifiSettings">
+  <summary>Wi-Fi and device name (optional)</summary>
+  <p>Writes these into the factory defaults (<code>/caldata/FENV.bin</code>) of the selected image before it is flashed.
+     Leave the network name empty to keep the image's Wi-Fi settings, and the device name empty to keep its name.</p>
+  <p>
+    <label>Device name <input type="text" id="deviceName" maxlength="63" autocomplete="off" placeholder="HK Invoke"></label>
+  </p>
+  <p>
+    <label>Network name <input type="text" id="wifiSsid" maxlength="32" autocomplete="off"></label>
+    <label>Security
+      <select id="wifiSecurity">
+        <option value="WPA-PSK">WPA/WPA2 personal</option>
+        <option value="NONE">Open (no password)</option>
+      </select>
+    </label>
+    <label>Password <input type="password" id="wifiPassword" maxlength="63" autocomplete="off"></label>
+  </p>
+</details>
 <p><label><input type="checkbox" id="advanced"> Advanced options</label></p>
 <p id="advancedOptions" hidden>
   VID <input type="text" id="vid" value="1286">
@@ -71,6 +90,8 @@
   <input type="text" id="cmd" placeholder="Console input (Enter to send)" disabled>
 </details>
 
+<script src="squashfs.js"></script>
+<script src="patch.js"></script>
 <script>
 // WebUSB is missing in Firefox, Safari and iOS browsers, and on pages that are not served
 // over HTTPS (or localhost). Replace the page with a notice and stop the script.
@@ -146,6 +167,7 @@ let firmwareList = [];            // entries from firmware/manifest.json: { name
 let downloadToken = 0;            // identifies the latest firmware download, so stale ones are dropped
 let device = null;                // the USB device currently being served
 let stopped = true;
+let patchedImage = null;          // 83_IMAGE with the Wi-Fi/device name settings applied, when any were given
 let sendingImage = false;         // image requests are ignored while one is being sent
 let promptSeen = false;
 let logRelay = Promise.resolve();
@@ -451,7 +473,7 @@ async function writeImage(file, withHeader, onProgress) {
 
 // Returns true if the image was sent. With `quiet`, a failure is not reported (the caller retries).
 async function sendImage(name, code, { withHeader = true, quiet = false } = {}) {
-  const file = generatedImage(name) || images.get(name);
+  const file = generatedImage(name) || (name === '83_IMAGE' && patchedImage) || images.get(name);
   if (!file) {
     log(`failed to open image file ${name}\n`);
     return false;
@@ -641,6 +663,28 @@ async function start() {
   $('debug').open = ubootMode();
   $('start').disabled = true;
   $('stop').disabled = false;
+
+  patchedImage = null;
+  const ssid = $('wifiSsid').value, deviceName = $('deviceName').value;
+  if ((ssid || deviceName) && !ubootMode()) {
+    setNote('Applying settings to the image...');
+    try {
+      const security = $('wifiSecurity').value;
+      patchedImage = await WifiPatch.patchImage(images.get('83_IMAGE'), {
+        ssid, security, passphrase: security === 'NONE' ? '' : $('wifiPassword').value, deviceName,
+      });
+      const applied = [ssid && `Wi-Fi network "${ssid}", ${security}`, deviceName && `device name "${deviceName}"`];
+      log(`Settings applied (${applied.filter(Boolean).join('; ')})\n`);
+      setNote('');
+    } catch (err) {
+      stopped = true;
+      $('stop').disabled = true;
+      updateStartButton();
+      log(`Settings not applied: ${err}\n`);
+      setNote(`Settings: ${err.message}`, true);
+      return;
+    }
+  }
 
   for (let dev = first; dev && !stopped; dev = await waitForDevice()) {
     await serve(dev);
