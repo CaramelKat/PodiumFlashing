@@ -6,6 +6,11 @@
       "file": "Final_Stock_Firmware.IMAGE"
     },
     {
+      "name": "Final Cortana Stock",
+      "description": "Barracuda_libre-11.1842.0. A clean image with no modifications, still shipping Cortana.",
+      "file": "Final_Cortana_Firmware.IMAGE"
+    },
+    {
       "name": "Rooted",
       "description": "Barracuda_rooted_libre-11.1842.0. ADB shell is enabled, SSH is enabled with root + an empty password",
       "file": "Rooted.IMAGE"
